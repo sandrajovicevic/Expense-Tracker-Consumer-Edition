@@ -5,6 +5,7 @@ gamification, notifications, and bank import.
 """
 
 import io
+import json
 import uuid
 import calendar
 import datetime as dt
@@ -72,10 +73,47 @@ def _cur_sym(cur: str) -> str:
     return "€" if cur == "EUR" else get_currency_symbol(cur)
 
 
-def _eur(amount: float, currency: str, rate: float) -> float:
+def _eur(amount: float, currency: str, rate: float, cur_rates: dict = None) -> float:
+    """Convert amount in given currency to EUR using per-currency rates or fallback rate."""
     if currency == "EUR":
         return amount
+    if cur_rates and currency in cur_rates and float(cur_rates[currency]) > 0:
+        return round(amount / float(cur_rates[currency]), 4)
     return round(amount / rate, 4)
+
+
+# ── Settings & per-currency rates ─────────────────────────────────────────────
+settings    = get_settings(user_id)
+rate        = float(settings.get("exchange_rate", 117.0))
+_cur_rates  = settings.get("currency_rates", {}) or {}
+# Ensure the configured local currency uses the main rate as fallback
+_local_dc   = settings.get("default_currency", "EUR")
+if _local_dc != "EUR" and _local_dc not in _cur_rates:
+    _cur_rates[_local_dc] = rate
+
+# ── Data cache ────────────────────────────────────────────────────────────────
+_CACHE_KEY = f"_D_{user_id}"
+
+
+def _load_all() -> dict:
+    return {
+        "exp": get_expenses(user_id),
+        "inc": get_income(user_id),
+        "sav": get_savings(user_id),
+        "bud": get_budgets(user_id),
+        "rec": get_recurring(user_id),
+    }
+
+
+def _invalidate():
+    """Call after any write to force a data reload on the next rerun."""
+    st.session_state.pop(_CACHE_KEY, None)
+
+
+if _CACHE_KEY not in st.session_state:
+    st.session_state[_CACHE_KEY] = _load_all()
+
+_D = st.session_state[_CACHE_KEY]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -122,7 +160,6 @@ def render_onboarding():
         st.title("Step 1 of 2 — Your Currency & Budget")
         st.caption("You can change these any time in Settings.")
 
-        settings = get_settings(user_id)
         with st.form("onboard_step1"):
             dc = st.selectbox("Display currency", list(SUPPORTED_CURRENCIES.keys()),
                               index=0, help="The currency you'll see amounts in.")
@@ -132,7 +169,7 @@ def render_onboarding():
                                        help="If you use EUR only, leave this as-is.")
             budget   = st.number_input("Monthly budget (EUR)",
                                        min_value=0.0, step=100.0, format="%.2f",
-                                       help="Your total spending limit per month. You can set category limits later.")
+                                       help="Your total spending limit per month.")
             if st.form_submit_button("Save & Continue →", type="primary", use_container_width=True):
                 save_settings(user_id, {
                     "default_currency": dc,
@@ -145,9 +182,6 @@ def render_onboarding():
     elif step == 2:
         st.title("Step 2 of 2 — Log Your First Expense")
         st.caption("Or skip — you can log expenses anytime from the main menu.")
-
-        settings = get_settings(user_id)
-        rate     = float(settings.get("exchange_rate", 117.0))
 
         with st.form("onboard_exp"):
             c1, c2 = st.columns(2)
@@ -177,6 +211,7 @@ def render_onboarding():
             st.session_state.onboarding_complete = True
             st.success("🎉 You're all set! Welcome to your Expense Tracker.")
             st.balloons()
+            _invalidate()
             st.rerun()
 
         if skipped:
@@ -195,9 +230,6 @@ if not st.session_state.get("onboarding_complete", True):
 # MAIN APP
 # ══════════════════════════════════════════════════════════════════════════════
 
-settings = get_settings(user_id)
-rate     = float(settings.get("exchange_rate", 117.0))
-
 PAGES = [
     "📅 Log Expense", "💵 Log Income", "🎯 Savings Goals", "🔄 Recurring",
     "📊 Dashboard", "📈 Forecast", "💡 Insights", "🏦 Bank Import",
@@ -211,10 +243,10 @@ with st.sidebar:
     st.divider()
 
     st.markdown("**Display currency**")
-    cur_list = list(SUPPORTED_CURRENCIES.keys())
+    cur_list   = list(SUPPORTED_CURRENCIES.keys())
     dc_default = settings.get("default_currency", "EUR")
-    dc_idx = cur_list.index(dc_default) if dc_default in cur_list else 0
-    DC = st.selectbox("Currency", cur_list, index=dc_idx, label_visibility="collapsed")
+    dc_idx     = cur_list.index(dc_default) if dc_default in cur_list else 0
+    DC  = st.selectbox("Currency", cur_list, index=dc_idx, label_visibility="collapsed")
     SYM = get_currency_symbol(DC)
 
     st.markdown("**💱 Exchange rate (1 EUR)**")
@@ -222,17 +254,14 @@ with st.sidebar:
                           label_visibility="collapsed")
     if abs(nr - rate) > 0.001:
         save_settings(user_id, {**settings, "exchange_rate": nr})
+        _invalidate()
         st.rerun()
     st.caption(f"1 EUR = {rate:.2f} {get_currency_symbol(DC)}")
 
     st.divider()
 
-    # Gamification
-    _exp_df_side = get_expenses(user_id)
-    _inc_df_side = get_income(user_id)
-    _sav_df_side = get_savings(user_id)
-    _bud_df_side = get_budgets(user_id)
-    render_gamification_sidebar(_exp_df_side, _inc_df_side, _sav_df_side, _bud_df_side)
+    # Gamification (uses cached data)
+    render_gamification_sidebar(_D["exp"], _D["inc"], _D["sav"], _D["bud"])
 
     st.divider()
     st.caption("📱 Phone access:")
@@ -242,12 +271,9 @@ with st.sidebar:
         logout()
         st.rerun()
 
-# ── Recurring bill & budget alerts ───────────────────────────────────────────
-_rec_df_alerts  = get_recurring(user_id)
-_exp_df_alerts  = get_expenses(user_id)
-_bud_df_alerts  = get_budgets(user_id)
-check_and_send_bill_reminders(user_id, _rec_df_alerts, _exp_df_alerts, settings)
-check_and_send_budget_alerts(user_id, _exp_df_alerts, _bud_df_alerts, settings, rate, DC)
+# ── Recurring bill & budget alerts (uses cached data) ────────────────────────
+check_and_send_bill_reminders(user_id, _D["rec"], _D["exp"], settings)
+check_and_send_budget_alerts(user_id, _D["exp"], _D["bud"], settings, rate, DC)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -284,7 +310,7 @@ if page == "📅 Log Expense":
         if not desc.strip():
             safe_error("Please add a description so you can find this expense later.")
         else:
-            ae = _eur(amount, cur, rate)
+            ae = _eur(amount, cur, rate, _cur_rates)
             add_expense(user_id, {
                 "date": exp_date, "category": cat,
                 "subcategory": subcat if subcat != "—" else "",
@@ -300,13 +326,14 @@ if page == "📅 Log Expense":
                     "currency": cur, "amount_eur": ae,
                     "notes": notes, "active": True,
                 })
-            st.success(f"✅ **{desc}** — {fmt_both(ae, rate)}")
+            st.success(f"✅ **{desc}** — {fmt_both(ae, DC, rate)}")
             st.balloons()
+            _invalidate()
 
     # ── Expense history ────────────────────────────────────────────────────────
     st.divider()
     st.subheader("Expense history")
-    df_exp = get_expenses(user_id)
+    df_exp = _D["exp"]
 
     if not df_exp.empty:
         sc1, sc2, sc3 = st.columns([3, 2, 2])
@@ -327,47 +354,80 @@ if page == "📅 Log Expense":
         d["🔄"]       = d["recurring"].apply(lambda x: "🔄" if str(x).lower() in ("true","1") else "")
 
         st.dataframe(
-            d[["#","Date","category","subcategory","description","Amount","Original","🔄","notes"]],
+            d[["Date","category","subcategory","description","Amount","Original","🔄","notes"]],
             use_container_width=True, hide_index=True,
         )
 
-        # Edit / soft-delete
-        with st.expander("✏️ Edit or delete a row"):
-            row_num = st.number_input("Row # from table above", min_value=0,
-                                      max_value=max(0, len(d)-1), step=1, key="exp_edit_idx")
-            act = st.radio("Action", ["Edit", "Delete"], horizontal=True, key="exp_act")
+        # ── Edit / soft-delete (selectbox-based, not row number) ──────────────
+        with st.expander("✏️ Edit or delete an entry"):
+            if d.empty:
+                st.info("No entries match the current filter.")
+            else:
+                exp_labels = [
+                    f"{r['Date']} — {str(r['description'])[:30]} — {fmt(r['amount_eur'], DC, rate)}"
+                    for _, r in d.iterrows()
+                ]
+                sel_label = st.selectbox("Select expense", exp_labels, key="exp_sel")
+                sel_idx   = exp_labels.index(sel_label)
+                sel_id    = d.iloc[sel_idx]["id"]
+                rd        = df_exp[df_exp["id"] == sel_id].iloc[0]
 
-            if row_num in d["#"].values:
-                sel_id = d[d["#"] == row_num]["id"].iloc[0]
-                rd     = df_exp[df_exp["id"] == sel_id].iloc[0]
+                act = st.radio("Action", ["Edit", "Delete"], horizontal=True, key="exp_act")
 
                 if act == "Delete":
-                    if st.button("🗑️ Move to Trash", type="secondary"):
+                    st.warning(
+                        f"Delete **{rd['description']}** "
+                        f"({fmt(float(rd['amount_eur']), DC, rate)}) on "
+                        f"{rd['date'].strftime('%d %b %Y') if pd.notna(rd['date']) else '?'}?"
+                    )
+                    if st.button("🗑️ Yes, move to Trash", type="secondary"):
                         soft_delete_expense(user_id, sel_id)
-                        st.toast("Moved to trash — you can restore it below.", icon="🗑️")
+                        _invalidate()
+                        st.toast("Moved to trash — restore it below if needed.", icon="🗑️")
                         st.rerun()
                 else:
+                    # Category outside form so subcategory list updates reactively
+                    edit_cat = st.selectbox(
+                        "Category",
+                        CAT_LIST,
+                        index=CAT_LIST.index(str(rd.get("category","Other")))
+                              if str(rd.get("category","Other")) in CAT_LIST else 0,
+                        key="exp_edit_cat",
+                    )
                     with st.form("exp_edit_form"):
                         ec1, ec2 = st.columns(2)
                         with ec1:
-                            ed  = st.date_input("Date", value=rd["date"].date()
-                                                if pd.notna(rd["date"]) else date.today())
-                            edd = st.text_input("Description", value=str(rd.get("description","")))
+                            ed   = st.date_input("Date",
+                                                  value=rd["date"].date()
+                                                  if pd.notna(rd["date"]) else date.today())
+                            esub = st.selectbox(
+                                "Subcategory",
+                                ["—"] + CATEGORIES.get(edit_cat, []),
+                                index=0,
+                            )
                         with ec2:
-                            ea  = st.number_input("Amount", value=float(rd.get("amount",0)),
-                                                  min_value=0.01, max_value=MAX_AMOUNT,
-                                                  step=0.01, format="%.2f")
-                            en  = st.text_input("Notes", value=str(rd.get("notes","")))
+                            ea  = st.number_input("Amount",
+                                                   value=float(rd.get("amount", 0)),
+                                                   min_value=0.01, max_value=MAX_AMOUNT,
+                                                   step=0.01, format="%.2f")
+                            en  = st.text_input("Notes", value=str(rd.get("notes", "")))
+                        edd = st.text_input("Description", value=str(rd.get("description", "")))
                         if st.form_submit_button("💾 Save changes", type="primary"):
-                            ec = str(rd.get("currency","EUR"))
+                            ec = str(rd.get("currency", "EUR"))
                             update_expense(user_id, sel_id, {
-                                "date": ed, "description": edd,
-                                "amount": ea, "amount_eur": _eur(ea, ec, rate), "notes": en,
+                                "date": ed,
+                                "description": edd,
+                                "category": edit_cat,
+                                "subcategory": esub if esub != "—" else "",
+                                "amount": ea,
+                                "amount_eur": _eur(ea, ec, rate, _cur_rates),
+                                "notes": en,
                             })
+                            _invalidate()
                             st.toast("✅ Updated!", icon="✅")
                             st.rerun()
 
-        # Restore deleted
+        # ── Restore deleted ────────────────────────────────────────────────────
         df_deleted = get_expenses(user_id, include_deleted=True)
         df_deleted = df_deleted[df_deleted["is_deleted"] == True]
         if not df_deleted.empty:
@@ -379,6 +439,7 @@ if page == "📅 Log Expense":
                     with rc3:
                         if st.button("↩️ Restore", key=f"rst_{row['id']}"):
                             restore_expense(user_id, row["id"])
+                            _invalidate()
                             st.toast("Expense restored!", icon="↩️")
                             st.rerun()
 
@@ -403,11 +464,21 @@ elif page == "💵 Log Income":
         cur = st.selectbox("Currency", list(SUPPORTED_CURRENCIES.keys()), key="inc_cur")
     sym = _cur_sym(cur)
 
+    # Source: free text with quick-pick suggestions
+    src_pick = st.selectbox(
+        "Quick-pick a common source (or type your own below)",
+        [""] + INCOME_SOURCES,
+        key="inc_src_pick",
+        label_visibility="visible",
+    )
+
     with st.form("inc_form", clear_on_submit=False):
         c1, c2 = st.columns(2)
         with c1:
             inc_date = st.date_input("Date", value=date.today())
-            source   = st.selectbox("Source", INCOME_SOURCES)
+            source   = st.text_input("Source *",
+                                     value=src_pick if src_pick else "",
+                                     placeholder="e.g. Primary Salary")
         with c2:
             budgeted = st.number_input(f"Budgeted ({sym})", min_value=0.0,
                                        max_value=MAX_AMOUNT, step=10.0, format="%.2f")
@@ -417,16 +488,17 @@ elif page == "💵 Log Income":
         saved = st.form_submit_button("✅ Save Income", use_container_width=True, type="primary")
 
     if saved:
-        be = _eur(budgeted, cur, rate)
-        ae = _eur(actual,   cur, rate)
+        be = _eur(budgeted, cur, rate, _cur_rates)
+        ae = _eur(actual,   cur, rate, _cur_rates)
         add_income(user_id, {
-            "date": inc_date, "source": source,
+            "date": inc_date, "source": source or "Other",
             "budgeted": budgeted, "actual": actual,
             "currency": cur, "budgeted_eur": be, "actual_eur": ae, "notes": notes,
         })
-        st.success(f"✅ {source} — {fmt_both(ae, rate)}")
+        st.success(f"✅ {source or 'Income'} — {fmt_both(ae, DC, rate)}")
+        _invalidate()
 
-    dfi = get_income(user_id)
+    dfi = _D["inc"]
     if not dfi.empty:
         st.divider()
         st.subheader("Income history")
@@ -439,13 +511,17 @@ elif page == "💵 Log Income":
                      use_container_width=True, hide_index=True)
 
         with st.expander("🗑️ Delete an income entry"):
-            del_ids = dfi["id"].tolist()
-            del_labels = [f"{r['date'].strftime('%d %b %Y')} — {r['source']} {fmt(r['actual_eur'], DC, rate)}"
-                          for _, r in dfi.iterrows()]
+            del_ids    = dfi["id"].tolist()
+            del_labels = [
+                f"{r['date'].strftime('%d %b %Y')} — {r['source']} {fmt(r['actual_eur'], DC, rate)}"
+                for _, r in dfi.iterrows()
+            ]
             sel = st.selectbox("Select entry", del_labels, key="inc_del_sel")
+            st.warning(f"This will move the selected entry to trash.")
             if st.button("🗑️ Move to trash", type="secondary", key="inc_del_btn"):
                 sel_idx = del_labels.index(sel)
                 soft_delete_income(user_id, del_ids[sel_idx])
+                _invalidate()
                 st.toast("Income entry moved to trash.", icon="🗑️")
                 st.rerun()
 
@@ -471,11 +547,21 @@ elif page == "🎯 Savings Goals":
         cur = st.selectbox("Save in", list(SUPPORTED_CURRENCIES.keys()), key="sav_cur")
     sym = _cur_sym(cur)
 
+    # Goal name: free text with quick-pick suggestions
+    goal_pick = st.selectbox(
+        "Quick-pick a common goal (or type your own below)",
+        [""] + SAVINGS_GOALS,
+        key="sav_goal_pick",
+        label_visibility="visible",
+    )
+
     with st.form("sav_form", clear_on_submit=False):
         c1, c2 = st.columns(2)
         with c1:
             sd  = st.date_input("Date", value=date.today())
-            gn  = st.selectbox("Goal", SAVINGS_GOALS)
+            gn  = st.text_input("Goal name *",
+                                 value=goal_pick if goal_pick else "",
+                                 placeholder="e.g. Emergency Fund")
             tgt = st.number_input(f"Target ({sym})", min_value=0.0,
                                   max_value=MAX_SAVINGS_TARGET, step=100.0, format="%.2f")
         with c2:
@@ -488,24 +574,28 @@ elif page == "🎯 Savings Goals":
         saved = st.form_submit_button("✅ Save Entry", use_container_width=True, type="primary")
 
     if saved:
-        de = _eur(dep, cur, rate)
-        te = _eur(tgt, cur, rate)
-        dfs_prev = get_savings(user_id)
-        pb = 0.0
-        if not dfs_prev.empty:
-            pr = dfs_prev[dfs_prev["goal_name"] == gn]
-            if not pr.empty:
-                pb = float(pr.sort_values("date").iloc[-1]["balance_eur"])
-        mr = (ir / 100) / 12
-        nb = round(pb * (1 + mr) + de, 4)
-        add_savings(user_id, {
-            "date": sd, "goal_name": gn, "target_eur": te,
-            "deposited": dep, "currency": cur,
-            "deposited_eur": de, "interest_rate": ir, "balance_eur": nb, "notes": notes,
-        })
-        st.success(f"✅ {gn} — new balance: {fmt_both(nb, rate)}")
+        if not gn.strip():
+            safe_error("Please enter a goal name.")
+        else:
+            de = _eur(dep, cur, rate, _cur_rates)
+            te = _eur(tgt, cur, rate, _cur_rates)
+            dfs_prev = _D["sav"]
+            pb = 0.0
+            if not dfs_prev.empty:
+                pr = dfs_prev[dfs_prev["goal_name"] == gn.strip()]
+                if not pr.empty:
+                    pb = float(pr.sort_values("date").iloc[-1]["balance_eur"])
+            mr = (ir / 100) / 12
+            nb = round(pb * (1 + mr) + de, 4)
+            add_savings(user_id, {
+                "date": sd, "goal_name": gn.strip(), "target_eur": te,
+                "deposited": dep, "currency": cur,
+                "deposited_eur": de, "interest_rate": ir, "balance_eur": nb, "notes": notes,
+            })
+            st.success(f"✅ {gn.strip()} — new balance: {fmt_both(nb, DC, rate)}")
+            _invalidate()
 
-    dfs = get_savings(user_id)
+    dfs = _D["sav"]
     if not dfs.empty:
         st.divider()
         st.subheader("Goal progress")
@@ -576,7 +666,7 @@ elif page == "🔄 Recurring":
                   "These are fixed monthly costs like rent, subscriptions, or utilities. "
                   "Add them here once — then tap 'Log now' each month instead of re-entering everything.")
 
-    dfe   = get_expenses(user_id)
+    dfe   = _D["exp"]
     today = date.today()
 
     with st.expander("➕ Add new template"):
@@ -595,7 +685,7 @@ elif page == "🔄 Recurring":
                                          max_value=MAX_AMOUNT, step=0.50, format="%.2f")
                 rnotes = st.text_input("Notes")
             if st.form_submit_button("💾 Save template", type="primary"):
-                re_eur = _eur(ramt, rc, rate)
+                re_eur = _eur(ramt, rc, rate, _cur_rates)
                 add_recurring(user_id, {
                     "category": rcat,
                     "subcategory": rsub if rsub != "—" else "",
@@ -604,9 +694,10 @@ elif page == "🔄 Recurring":
                     "notes": rnotes, "active": True,
                 })
                 st.success(f"✅ {rdesc} saved as template!")
+                _invalidate()
                 st.rerun()
 
-    dfr    = get_recurring(user_id)
+    dfr    = _D["rec"]
     active = dfr[dfr["active"] == True] if not dfr.empty else pd.DataFrame()
 
     if active.empty:
@@ -644,10 +735,12 @@ elif page == "🔄 Recurring":
                         "amount_eur": float(row["amount_eur"]),
                         "recurring": True, "notes": str(row.get("notes","")),
                     })
+                    _invalidate()
                     st.rerun()
             with rc4:
                 if st.button("Remove", key=f"dr_{idx}", type="secondary"):
                     update_recurring(user_id, row["id"], {"active": False})
+                    _invalidate()
                     st.rerun()
             st.divider()
 
@@ -658,10 +751,10 @@ elif page == "🔄 Recurring":
 elif page == "📊 Dashboard":
     st.title("📊 Dashboard")
 
-    dfe = get_expenses(user_id)
-    dfi = get_income(user_id)
-    dfs = get_savings(user_id)
-    dfb = get_budgets(user_id)
+    dfe = _D["exp"]
+    dfi = _D["inc"]
+    dfs = _D["sav"]
+    dfb = _D["bud"]
 
     # Household toggle
     hh_id = st.session_state.get("household_id")
@@ -697,8 +790,8 @@ elif page == "📊 Dashboard":
     inc   = flt(dfi)
     svyr  = dfs[dfs["date"].dt.year == sy] if not dfs.empty else dfs
 
-    ie = float(inc["actual_eur"].sum())  if not inc.empty  else 0.0
-    ee = float(exp["amount_eur"].sum())  if not exp.empty  else 0.0
+    ie = float(inc["actual_eur"].sum())     if not inc.empty  else 0.0
+    ee = float(exp["amount_eur"].sum())     if not exp.empty  else 0.0
     sd = float(svyr["deposited_eur"].sum()) if not svyr.empty else 0.0
     ne = ie - ee - sd
     sr = (sd / ie * 100) if ie > 0 else 0.0
@@ -863,8 +956,8 @@ elif page == "📊 Dashboard":
         tp = exp.nlargest(10, "amount_eur")[
             ["date","category","subcategory","description","amount_eur","currency"]
         ].copy()
-        tp["date"]     = tp["date"].dt.strftime("%d %b %Y").fillna("")
-        tp["EUR / RSD"]= tp["amount_eur"].apply(lambda x: fmt_both(x, rate))
+        tp["date"]   = tp["date"].dt.strftime("%d %b %Y").fillna("")
+        tp["Amount"] = tp["amount_eur"].apply(lambda x: fmt_both(x, DC, rate))
         st.dataframe(tp.drop(columns=["amount_eur"]), use_container_width=True, hide_index=True)
 
 
@@ -876,8 +969,8 @@ elif page == "📈 Forecast":
     st.caption("Based on your salary cycle: detected from your last income entry.")
 
     today      = date.today()
-    dfi_all    = get_income(user_id)
-    SALARY_DAY = 10
+    dfi_all    = _D["inc"]
+    SALARY_DAY = int(settings.get("salary_day", 10))
 
     salary_rows = dfi_all[dfi_all["source"] == "Primary Salary"] if not dfi_all.empty else pd.DataFrame()
     if salary_rows.empty:
@@ -885,8 +978,8 @@ elif page == "📈 Forecast":
             date(today.year, today.month - 1, SALARY_DAY) if today.month > 1
             else date(today.year - 1, 12, SALARY_DAY)
         )
-        safe_warning("No salary entry found — using the 10th as cycle start. "
-                     "Log a 'Primary Salary' income entry to enable automatic detection.")
+        safe_warning(f"No 'Primary Salary' income found — using day {SALARY_DAY} as cycle start. "
+                     "Log a 'Primary Salary' income entry, or change the salary day in ⚙️ Settings → Budget.")
     else:
         latest_salary = salary_rows.sort_values("date").iloc[-1]
         period_start  = latest_salary["date"].date()
@@ -903,8 +996,8 @@ elif page == "📈 Forecast":
     st.info(f"📅 **{period_start.strftime('%d %b')} → {period_end.strftime('%d %b %Y')}** "
             f"({days_in_period} days · {days_elapsed} in · {days_remaining} left)")
 
-    dfe = get_expenses(user_id)
-    dfb = get_budgets(user_id)
+    dfe = _D["exp"]
+    dfb = _D["bud"]
     period_start_ts = pd.Timestamp(period_start)
     period_end_ts   = pd.Timestamp(period_end)
 
@@ -970,8 +1063,7 @@ elif page == "📈 Forecast":
 # ══════════════════════════════════════════════════════════════════════════════
 elif page == "💡 Insights":
     render_insights(
-        get_expenses(user_id), get_income(user_id),
-        get_savings(user_id), settings, DC, rate,
+        _D["exp"], _D["inc"], _D["sav"], settings, DC, rate,
     )
 
 
@@ -979,7 +1071,7 @@ elif page == "💡 Insights":
 # PAGE: BANK IMPORT
 # ══════════════════════════════════════════════════════════════════════════════
 elif page == "🏦 Bank Import":
-    render_bank_import_page(user_id, rate)
+    render_bank_import_page(user_id, rate, existing_df=_D["exp"])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1084,7 +1176,34 @@ elif page == "⚙️ Settings":
                                     settings.get("default_currency","EUR")))
             if st.form_submit_button("💾 Save", type="primary"):
                 save_settings(user_id, {"exchange_rate": nr2, "default_currency": dc2})
+                _invalidate()
                 st.success(f"✅ Saved — 1 EUR = {nr2:.2f} {get_currency_symbol(dc2)}")
+                st.rerun()
+
+        st.divider()
+        st.subheader("Per-currency exchange rates")
+        st.caption("Set the rate for currencies other than your main local currency. "
+                   "Leave 0 to fall back to the main rate above.")
+
+        non_eur_currencies = [c for c in SUPPORTED_CURRENCIES if c != "EUR"]
+        cur_rates_now = dict(_cur_rates)
+
+        with st.form("per_cur_form"):
+            rate_inputs = {}
+            cols_pc = st.columns(3)
+            for i, code in enumerate(non_eur_currencies):
+                with cols_pc[i % 3]:
+                    rate_inputs[code] = st.number_input(
+                        f"1 EUR → {code}",
+                        value=float(cur_rates_now.get(code, 0.0)),
+                        min_value=0.0, step=0.1, format="%.4f",
+                        key=f"cr_{code}",
+                    )
+            if st.form_submit_button("💾 Save per-currency rates", type="primary"):
+                new_rates = {k: v for k, v in rate_inputs.items() if v > 0}
+                save_settings(user_id, {"currency_rates": json.dumps(new_rates)})
+                _invalidate()
+                st.success("✅ Per-currency rates saved.")
                 st.rerun()
 
     # ── Budget tab ────────────────────────────────────────────────────────────
@@ -1095,9 +1214,16 @@ elif page == "⚙️ Settings":
             ob_amt = st.number_input("Total monthly budget (€)", min_value=0.0,
                                      max_value=MAX_SAVINGS_TARGET,
                                      step=50.0, format="%.2f", value=cur_eur)
+            sd_val = st.number_input(
+                "Salary day (day of month your pay cycle starts)",
+                min_value=1, max_value=28,
+                value=int(settings.get("salary_day", 10)), step=1,
+                help="Used on the Forecast page. Max 28 to work in all months.",
+            )
             if st.form_submit_button("💾 Save budget", type="primary"):
-                save_settings(user_id, {"monthly_budget": ob_amt})
-                st.success(f"✅ Budget set to {fmt_both(ob_amt, rate)}")
+                save_settings(user_id, {"monthly_budget": ob_amt, "salary_day": int(sd_val)})
+                _invalidate()
+                st.success(f"✅ Budget set to {fmt_both(ob_amt, DC, rate)}")
                 st.rerun()
 
         st.divider()
@@ -1117,28 +1243,38 @@ elif page == "⚙️ Settings":
                 ba = st.number_input(f"Budget ({_cur_sym(bcur)})", min_value=0.0,
                                      max_value=MAX_SAVINGS_TARGET, step=10.0, format="%.2f")
             if st.form_submit_button("💾 Save", type="primary"):
-                be = _eur(ba, bcur, rate)
+                be = _eur(ba, bcur, rate, _cur_rates)
                 add_budget(user_id, {
                     "year": int(by), "month": int(bm), "category": bcat,
                     "subcategory": bsub if bsub != "(entire category)" else "",
                     "budgeted_eur": be,
                 })
+                _invalidate()
                 st.success("✅ Budget saved")
                 st.rerun()
 
-        dfb = get_budgets(user_id)
+        dfb = _D["bud"]
         if not dfb.empty:
             d = dfb.copy()
             d["month"]  = d["month"].apply(lambda x: calendar.month_name[int(x)])
-            d["Budget"] = d["budgeted_eur"].apply(lambda x: fmt_both(x, rate))
+            d["Budget"] = d["budgeted_eur"].apply(lambda x: fmt_both(x, DC, rate))
             st.dataframe(d[["year","month","category","subcategory","Budget"]],
                          use_container_width=True, hide_index=True)
+
             with st.expander("🗑️ Delete a budget row"):
-                di = st.number_input("Row index (from table)", min_value=0,
-                                     max_value=max(0, len(dfb)-1), step=1)
-                if st.button("Delete", type="secondary", key="del_bud"):
-                    bid = int(dfb.iloc[di]["id"])
+                bud_labels = [
+                    f"{calendar.month_name[int(r['month'])]} {int(r['year'])} — "
+                    f"{r['category']}"
+                    f"{' › ' + r['subcategory'] if r['subcategory'] else ''} — "
+                    f"€{r['budgeted_eur']:,.2f}"
+                    for _, r in dfb.iterrows()
+                ]
+                sel_bud = st.selectbox("Select budget to delete", bud_labels, key="bud_del_sel")
+                if st.button("🗑️ Delete", type="secondary", key="del_bud"):
+                    sel_bud_idx = bud_labels.index(sel_bud)
+                    bid = int(dfb.iloc[sel_bud_idx]["id"])
                     delete_budget(user_id, bid)
+                    _invalidate()
                     st.toast("Budget row deleted.", icon="🗑️")
                     st.rerun()
 
@@ -1198,8 +1334,8 @@ elif page == "⚙️ Settings":
             "expenses":  get_expenses(user_id, include_deleted=True),
             "income":    get_income(user_id, include_deleted=True),
             "savings":   get_savings(user_id, include_deleted=True),
-            "budgets":   get_budgets(user_id),
-            "recurring": get_recurring(user_id),
+            "budgets":   _D["bud"],
+            "recurring": _D["rec"],
         }
         cols = st.columns(len(data_map))
         for i, (key, df_d) in enumerate(data_map.items()):

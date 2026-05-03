@@ -181,9 +181,27 @@ def normalize_bank_csv(df: pd.DataFrame, bank_format: str) -> pd.DataFrame:
         return pd.DataFrame(columns=["date", "description", "amount", "currency"])
 
 
+# ── Duplicate detection ───────────────────────────────────────────────────────
+
+def _is_duplicate(desc: str, amount_eur: float, tx_date,
+                  existing_df: pd.DataFrame) -> bool:
+    """Return True if a matching expense already exists in existing_df."""
+    if existing_df is None or existing_df.empty:
+        return False
+    try:
+        mask = (
+            (existing_df["description"].str.lower() == str(desc).lower()) &
+            ((existing_df["amount_eur"] - amount_eur).abs() < 0.01) &
+            (existing_df["date"].dt.date == tx_date)
+        )
+        return bool(mask.any())
+    except Exception:
+        return False
+
+
 # ── Streamlit UI ──────────────────────────────────────────────────────────────
 
-def render_bank_import_page(user_id: int, rate: float):
+def render_bank_import_page(user_id: int, rate: float, existing_df=None):
     st.title("🏦 Import Bank Statement")
     st.caption("Import expenses directly from your bank's CSV export — we'll auto-categorise them for you.")
 
@@ -282,12 +300,17 @@ def render_bank_import_page(user_id: int, rate: float):
 
     st.divider()
     if st.button(f"✅ Import {len(display_rows)} expenses", type="primary", use_container_width=True):
-        imported = 0
-        skipped  = 0
+        imported   = 0
+        skipped    = 0
+        duplicates = 0
         for row in display_rows:
             try:
                 if row["amount_eur"] <= 0 or row["amount_eur"] > MAX_AMOUNT:
                     skipped += 1
+                    continue
+                if _is_duplicate(row["description"], row["amount_eur"],
+                                  row["date"], existing_df):
+                    duplicates += 1
                     continue
                 add_expense(user_id, {
                     "date": row["date"],
@@ -306,8 +329,12 @@ def render_bank_import_page(user_id: int, rate: float):
 
         if imported > 0:
             st.success(f"✅ Successfully imported **{imported}** expenses!")
+            if duplicates:
+                st.info(f"ℹ️ {duplicates} duplicate(s) skipped — already in your records.")
             if skipped:
                 st.caption(f"{skipped} row(s) skipped due to invalid amounts.")
             st.balloons()
+        elif duplicates:
+            st.warning(f"All {duplicates} transactions already exist in your records — nothing imported.")
         else:
             st.error("No expenses could be imported. Please check the data.")

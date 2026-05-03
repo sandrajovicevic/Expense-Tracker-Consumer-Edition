@@ -14,7 +14,7 @@ from datetime import datetime, date
 import pandas as pd
 from sqlalchemy import (
     create_engine, Column, Integer, String, Float, Boolean,
-    DateTime, Date, ForeignKey, Text, event
+    DateTime, Date, ForeignKey, Text, event, text
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
@@ -190,12 +190,28 @@ class UserSettings(Base):
     smtp_port        = Column(Integer, default=587)
     smtp_user        = Column(String, nullable=True)
     smtp_password_enc = Column(String, nullable=True)
+    salary_day        = Column(Integer, default=10)
+    currency_rates    = Column(Text, default="{}")
 
 
 # ── Init ──────────────────────────────────────────────────────────────────────
 
+def _migrate():
+    """Add new columns to existing tables without destroying data."""
+    engine = get_engine()
+    with engine.connect() as conn:
+        rows = conn.execute(text("PRAGMA table_info(user_settings)")).fetchall()
+        existing = {row[1] for row in rows}
+        if "salary_day" not in existing:
+            conn.execute(text("ALTER TABLE user_settings ADD COLUMN salary_day INTEGER DEFAULT 10"))
+        if "currency_rates" not in existing:
+            conn.execute(text("ALTER TABLE user_settings ADD COLUMN currency_rates TEXT DEFAULT '{}'"))
+        conn.commit()
+
+
 def init_db():
     Base.metadata.create_all(get_engine())
+    _migrate()
 
 
 # ── Audit helper ──────────────────────────────────────────────────────────────
@@ -470,6 +486,7 @@ _SETTINGS_DEFAULTS = {
     "exchange_rate": 117.0, "default_currency": "EUR", "monthly_budget": 0.0,
     "email_alerts": False, "alert_email": None, "smtp_host": None,
     "smtp_port": 587, "smtp_user": None, "smtp_password_enc": None,
+    "salary_day": 10, "currency_rates": {},
 }
 
 def get_settings(user_id):
@@ -477,7 +494,15 @@ def get_settings(user_id):
         obj = s.query(UserSettings).filter(UserSettings.user_id == user_id).first()
         if not obj:
             return dict(_SETTINGS_DEFAULTS)
-        return {k: getattr(obj, k, v) for k, v in _SETTINGS_DEFAULTS.items()}
+        result = {k: getattr(obj, k, v) for k, v in _SETTINGS_DEFAULTS.items()}
+    # Parse currency_rates JSON string → dict
+    cr = result.get("currency_rates", "{}")
+    if isinstance(cr, str):
+        try:
+            result["currency_rates"] = json.loads(cr) if cr else {}
+        except (json.JSONDecodeError, TypeError):
+            result["currency_rates"] = {}
+    return result
 
 
 def save_settings(user_id, settings_dict):
@@ -586,6 +611,19 @@ def get_user_by_username(username):
             "id": u.id, "username": u.username, "email": u.email,
             "password_hash": u.password_hash, "display_name": u.display_name or u.username,
             "household_id": u.household_id, "onboarding_complete": u.onboarding_complete,
+        }
+
+
+def get_user_by_email(email: str):
+    email = email.strip().lower()
+    with get_session() as s:
+        u = s.query(User).filter(User.email == email).first()
+        if not u:
+            return None
+        return {
+            "id": u.id, "username": u.username, "email": u.email,
+            "password_hash": u.password_hash,
+            "display_name": u.display_name or u.username,
         }
 
 

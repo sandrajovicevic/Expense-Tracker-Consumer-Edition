@@ -64,9 +64,15 @@ def fmt(eur: float, currency: str, rate: float) -> str:
     return f"{sym}{v:,.2f}"
 
 
-def fmt_both(eur: float, rate: float) -> str:
-    """Show value in both EUR and RSD."""
-    return f"€{eur:,.2f}  /  {eur * rate:,.0f} din"
+def fmt_both(eur: float, DC: str, rate: float) -> str:
+    """Show EUR value; if DC is not EUR also show the local equivalent."""
+    if DC == "EUR":
+        return f"€{eur:,.2f}"
+    sym   = get_currency_symbol(DC)
+    local = eur * rate
+    if DC in ("RSD", "HUF", "HRK"):
+        return f"{local:,.0f} {sym}  /  €{eur:,.2f}"
+    return f"{sym}{local:,.2f}  /  €{eur:,.2f}"
 
 
 def pbar(pct: float, color: str) -> str:
