@@ -151,7 +151,7 @@ def render_login_page():
         # ── Register tab ──────────────────────────────────────────────────────
         with tab_register:
             with st.form("register_form"):
-                r_display = st.text_input("Your name", placeholder="e.g. Sandra")
+                r_display = st.text_input("Your name", placeholder="e.g. Username")
                 r_username = st.text_input("Username", placeholder="min. 3 characters")
                 r_email    = st.text_input("Email address", placeholder="you@example.com")
                 r_pass     = st.text_input("Password", type="password",
