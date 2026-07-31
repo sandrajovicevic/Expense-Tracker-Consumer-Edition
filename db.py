@@ -501,8 +501,15 @@ def get_audit_log(user_id, limit=200):
                 .filter(AuditLog.user_id == user_id)
                 .order_by(AuditLog.timestamp.desc())
                 .limit(limit).all())
+        # Materialise all attributes while rows are still attached to the session
+        data = [{
+            "id": r.id, "user_id": r.user_id, "action": r.action,
+            "table_name": r.table_name, "record_id": r.record_id,
+            "details": r.details, "timestamp": r.timestamp,
+            "ip_address": r.ip_address,
+        } for r in rows]
     cols = ["id","user_id","action","table_name","record_id","details","timestamp","ip_address"]
-    df = _to_df(rows, cols)
+    df = pd.DataFrame(data, columns=cols)
     return _parse_dates(df, ["timestamp"])
 
 

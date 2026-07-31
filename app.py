@@ -170,7 +170,7 @@ def render_onboarding():
                 add_expense(user_id, {
                     "date": exp_date, "category": cat, "subcategory": "",
                     "description": desc, "amount": amount,
-                    "currency": "EUR", "amount_eur": amount,
+                    "currency": "EUR", "amount_eur": _eur(amount, "EUR", rate),
                     "recurring": False, "notes": "",
                 })
             set_onboarding_complete(user_id)
@@ -246,7 +246,7 @@ with st.sidebar:
 _rec_df_alerts  = get_recurring(user_id)
 _exp_df_alerts  = get_expenses(user_id)
 _bud_df_alerts  = get_budgets(user_id)
-check_and_send_bill_reminders(user_id, _rec_df_alerts, _exp_df_alerts, settings)
+check_and_send_bill_reminders(_rec_df_alerts, _exp_df_alerts, settings)
 check_and_send_budget_alerts(user_id, _exp_df_alerts, _bud_df_alerts, settings, rate, DC)
 
 
