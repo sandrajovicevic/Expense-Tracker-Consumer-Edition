@@ -204,7 +204,8 @@ def log_audit(session, user_id, action, table_name, record_id, details, ip=None)
     entry = AuditLog(
         user_id=user_id, action=action, table_name=table_name,
         record_id=str(record_id),
-        details=json.dumps(details) if isinstance(details, dict) else str(details),
+        # default=str makes dates and other non-JSON objects serialisable
+        details=json.dumps(details, default=str) if isinstance(details, dict) else str(details),
         ip_address=ip
     )
     session.add(entry)
@@ -237,7 +238,9 @@ def get_expenses(user_id, include_deleted=False):
         if not include_deleted:
             q = q.filter(Expense.is_deleted == False)
         rows = q.order_by(Expense.date.desc()).all()
-    df = _to_df(rows, _EXP_COLS)
+        # Materialise while the session is still open — accessing attributes
+        # after the session closes raises DetachedInstanceError.
+        df = _to_df(rows, _EXP_COLS)
     return _parse_dates(df, ["date", "created_at", "deleted_at"])
 
 
@@ -302,7 +305,8 @@ def get_income(user_id, include_deleted=False):
         if not include_deleted:
             q = q.filter(Income.is_deleted == False)
         rows = q.order_by(Income.date.desc()).all()
-    df = _to_df(rows, _INC_COLS)
+        # Materialise while the session is still open
+        df = _to_df(rows, _INC_COLS)
     return _parse_dates(df, ["date", "created_at", "deleted_at"])
 
 
@@ -357,7 +361,8 @@ def get_savings(user_id, include_deleted=False):
         if not include_deleted:
             q = q.filter(Savings.is_deleted == False)
         rows = q.order_by(Savings.date.asc()).all()
-    df = _to_df(rows, _SAV_COLS)
+        # Materialise while the session is still open
+        df = _to_df(rows, _SAV_COLS)
     return _parse_dates(df, ["date", "created_at", "deleted_at"])
 
 
@@ -398,7 +403,8 @@ _BUD_COLS = ["id","user_id","year","month","category","subcategory","budgeted_eu
 def get_budgets(user_id):
     with get_session() as s:
         rows = s.query(Budget).filter(Budget.user_id == user_id).all()
-    return _to_df(rows, _BUD_COLS)
+        # Materialise while the session is still open
+        return _to_df(rows, _BUD_COLS)
 
 
 def add_budget(user_id, row):
@@ -433,7 +439,9 @@ _REC_COLS = ["id","user_id","category","subcategory","description",
 def get_recurring(user_id):
     with get_session() as s:
         rows = s.query(Recurring).filter(Recurring.user_id == user_id).all()
-    return _to_df(rows, _REC_COLS)
+        # Materialise while the session is still open — this was raising
+        # DetachedInstanceError because _to_df ran after the session closed.
+        return _to_df(rows, _REC_COLS)
 
 
 def add_recurring(user_id, row):
@@ -560,7 +568,8 @@ def get_household_expenses(household_id, include_deleted=False):
         if not include_deleted:
             q = q.filter(Expense.is_deleted == False)
         rows = q.order_by(Expense.date.desc()).all()
-    df = _to_df(rows, _EXP_COLS)
+        # Materialise while the session is still open
+        df = _to_df(rows, _EXP_COLS)
     return _parse_dates(df, ["date", "created_at", "deleted_at"])
 
 
