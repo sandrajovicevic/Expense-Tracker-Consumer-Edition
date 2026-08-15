@@ -3,7 +3,6 @@ bank_import.py — Bank statement CSV importer for Expense Tracker v3.
 Supports Revolut, N26, Wise, and generic CSV formats.
 """
 
-import uuid
 from datetime import date
 
 import pandas as pd
