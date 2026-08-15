@@ -242,7 +242,8 @@ def log_audit(session, user_id, action, table_name, record_id, details, ip=None)
     entry = AuditLog(
         user_id=user_id, action=action, table_name=table_name,
         record_id=str(record_id),
-        details=json.dumps(details, default=_json_default) if isinstance(details, dict) else str(details),
+        # default=str makes dates and other non-JSON objects serialisable
+        details=json.dumps(details, default=str) if isinstance(details, dict) else str(details),
         ip_address=ip
     )
     session.add(entry)
@@ -275,7 +276,9 @@ def get_expenses(user_id, include_deleted=False):
         if not include_deleted:
             q = q.filter(Expense.is_deleted == False)
         rows = q.order_by(Expense.date.desc()).all()
-    df = _to_df(rows, _EXP_COLS)
+        # Materialise while the session is still open — accessing attributes
+        # after the session closes raises DetachedInstanceError.
+        df = _to_df(rows, _EXP_COLS)
     return _parse_dates(df, ["date", "created_at", "deleted_at"])
 
 
@@ -340,7 +343,8 @@ def get_income(user_id, include_deleted=False):
         if not include_deleted:
             q = q.filter(Income.is_deleted == False)
         rows = q.order_by(Income.date.desc()).all()
-    df = _to_df(rows, _INC_COLS)
+        # Materialise while the session is still open
+        df = _to_df(rows, _INC_COLS)
     return _parse_dates(df, ["date", "created_at", "deleted_at"])
 
 
@@ -395,48 +399,9 @@ def get_savings(user_id, include_deleted=False):
         if not include_deleted:
             q = q.filter(Savings.is_deleted == False)
         rows = q.order_by(Savings.date.asc()).all()
-    df = _to_df(rows, _SAV_COLS)
-    df = _parse_dates(df, ["date", "created_at", "deleted_at"])
-    return _recompute_savings_balances(df)
-
-
-def _recompute_savings_balances(df: pd.DataFrame) -> pd.DataFrame:
-    """Rebuild each goal's running balance from its deposit history.
-
-    Interest is compounded monthly on the elapsed months between consecutive
-    deposits (using the earlier deposit's interest rate), so the balance stays
-    consistent even when rows are edited, deleted, or two deposits land in the
-    same month.
-    """
-    if df.empty:
-        return df
-    df = df.copy()
-    for goal in df["goal_name"].dropna().unique():
-        rows = df[df["goal_name"] == goal].sort_values("date", na_position="first")
-        prev_date = None
-        prev_rate = 0.0
-        bal = 0.0
-        first = True
-        for idx in rows.index:
-            r = df.loc[idx]
-            dep = float(r["deposited_eur"] or 0.0)
-            d = r["date"]
-            if first:
-                bal = dep
-                first = False
-            elif pd.isna(d) or pd.isna(prev_date):
-                # No usable date info — just add the deposit without interest.
-                bal += dep
-            else:
-                months = (d.year - prev_date.year) * 12 + (d.month - prev_date.month)
-                if months > 0 and prev_rate > 0:
-                    bal = bal * ((1 + prev_rate / 100 / 12) ** months)
-                bal += dep
-            df.at[idx, "balance_eur"] = round(bal, 4)
-            if not pd.isna(d):
-                prev_date = d
-            prev_rate = float(r["interest_rate"] or 0.0)
-    return df
+        # Materialise while the session is still open
+        df = _to_df(rows, _SAV_COLS)
+    return _parse_dates(df, ["date", "created_at", "deleted_at"])
 
 
 def add_savings(user_id, row):
@@ -487,7 +452,8 @@ _BUD_COLS = ["id","user_id","year","month","category","subcategory","budgeted_eu
 def get_budgets(user_id):
     with get_session() as s:
         rows = s.query(Budget).filter(Budget.user_id == user_id).all()
-    return _to_df(rows, _BUD_COLS)
+        # Materialise while the session is still open
+        return _to_df(rows, _BUD_COLS)
 
 
 def add_budget(user_id, row):
@@ -522,7 +488,9 @@ _REC_COLS = ["id","user_id","category","subcategory","description",
 def get_recurring(user_id):
     with get_session() as s:
         rows = s.query(Recurring).filter(Recurring.user_id == user_id).all()
-    return _to_df(rows, _REC_COLS)
+        # Materialise while the session is still open — this was raising
+        # DetachedInstanceError because _to_df ran after the session closed.
+        return _to_df(rows, _REC_COLS)
 
 
 def add_recurring(user_id, row):
@@ -591,8 +559,15 @@ def get_audit_log(user_id, limit=200):
                 .filter(AuditLog.user_id == user_id)
                 .order_by(AuditLog.timestamp.desc())
                 .limit(limit).all())
+        # Materialise all attributes while rows are still attached to the session
+        data = [{
+            "id": r.id, "user_id": r.user_id, "action": r.action,
+            "table_name": r.table_name, "record_id": r.record_id,
+            "details": r.details, "timestamp": r.timestamp,
+            "ip_address": r.ip_address,
+        } for r in rows]
     cols = ["id","user_id","action","table_name","record_id","details","timestamp","ip_address"]
-    df = _to_df(rows, cols)
+    df = pd.DataFrame(data, columns=cols)
     return _parse_dates(df, ["timestamp"])
 
 
@@ -653,14 +628,10 @@ def get_household_expenses(household_id, include_deleted=False):
                 .join(User, Expense.user_id == User.id)
                 .filter(User.household_id == household_id))
         if not include_deleted:
-            rows = rows.filter(Expense.is_deleted == False)
-        rows = rows.order_by(Expense.date.desc()).all()
-    data = []
-    for exp, display_name, username in rows:
-        rec = {c: getattr(exp, c) for c in _EXP_COLS}
-        rec["member"] = display_name or username
-        data.append(rec)
-    df = pd.DataFrame(data, columns=_HH_EXP_COLS)
+            q = q.filter(Expense.is_deleted == False)
+        rows = q.order_by(Expense.date.desc()).all()
+        # Materialise while the session is still open
+        df = _to_df(rows, _EXP_COLS)
     return _parse_dates(df, ["date", "created_at", "deleted_at"])
 
 

@@ -14,7 +14,7 @@ import bcrypt
 
 from db import (
     create_user, get_user_by_username, username_exists, email_exists,
-    update_user_password, get_session, log_audit, init_db
+    update_user_password, log_audit, init_db
 )
 
 logger = logging.getLogger(__name__)

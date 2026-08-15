@@ -226,7 +226,7 @@ def check_and_send_budget_alerts(user_id: int, expenses_df: pd.DataFrame,
                 )
 
 
-def check_and_send_bill_reminders(user_id: int, recurring_df: pd.DataFrame,
+def check_and_send_bill_reminders(recurring_df: pd.DataFrame,
                                    expenses_df: pd.DataFrame, settings: dict):
     """Show sidebar count of unlogged recurring bills this month."""
     if recurring_df.empty:
