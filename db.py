@@ -8,12 +8,13 @@ import uuid
 import json
 import random
 import string
+import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 
 import pandas as pd
 from sqlalchemy import (
-    create_engine, Column, Integer, String, Float, Boolean,
+    create_engine, Column, Integer, String, Float, Boolean, JSON,
     DateTime, Date, ForeignKey, Text, event
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
@@ -22,29 +23,43 @@ from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
 BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 DB_PATH  = os.path.join(BASE_DIR, "expense_tracker.db")
+BACKUP_DIR = os.path.join(BASE_DIR, "backups")
+
+# Override with e.g. postgresql+psycopg2://user:pass@host/db when hosting.
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 _engine  = None
 _Session = None
 Base     = declarative_base()
 
 
+def _utcnow():
+    return datetime.now(timezone.utc)
+
+
 def get_engine():
     global _engine
     if _engine is None:
-        os.makedirs(BASE_DIR, exist_ok=True)
-        _engine = create_engine(f"sqlite:///{DB_PATH}", connect_args={"check_same_thread": False})
-        # Enable WAL mode for better concurrent access
-        @event.listens_for(_engine, "connect")
-        def set_wal(dbapi_conn, _):
-            dbapi_conn.execute("PRAGMA journal_mode=WAL")
-            dbapi_conn.execute("PRAGMA foreign_keys=ON")
+        if DATABASE_URL:
+            _engine = create_engine(DATABASE_URL)
+        else:
+            os.makedirs(BASE_DIR, exist_ok=True)
+            _engine = create_engine(f"sqlite:///{DB_PATH}", connect_args={"check_same_thread": False})
+            # Enable WAL mode for better concurrent access (SQLite only)
+            @event.listens_for(_engine, "connect")
+            def set_wal(dbapi_conn, _):
+                dbapi_conn.execute("PRAGMA journal_mode=WAL")
+                dbapi_conn.execute("PRAGMA foreign_keys=ON")
     return _engine
 
 
 def _get_session_factory():
     global _Session
     if _Session is None:
-        _Session = sessionmaker(bind=get_engine())
+        # expire_on_commit=False: rows are converted to dicts/DataFrames AFTER
+        # the session closes, so refreshing expired attributes on detached
+        # instances would raise DetachedInstanceError.
+        _Session = sessionmaker(bind=get_engine(), expire_on_commit=False)
     return _Session
 
 
@@ -69,7 +84,7 @@ class Household(Base):
     id          = Column(Integer, primary_key=True, autoincrement=True)
     name        = Column(String, nullable=False)
     invite_code = Column(String, unique=True)
-    created_at  = Column(DateTime, default=datetime.utcnow)
+    created_at  = Column(DateTime, default=_utcnow)
     members     = relationship("User", back_populates="household")
 
 
@@ -82,7 +97,7 @@ class User(Base):
     display_name        = Column(String)
     household_id        = Column(Integer, ForeignKey("households.id"), nullable=True)
     is_admin            = Column(Boolean, default=False)
-    created_at          = Column(DateTime, default=datetime.utcnow)
+    created_at          = Column(DateTime, default=_utcnow)
     onboarding_complete = Column(Boolean, default=False)
     household           = relationship("Household", back_populates="members")
 
@@ -102,7 +117,7 @@ class Expense(Base):
     notes        = Column(String, default="")
     is_deleted   = Column(Boolean, default=False)
     deleted_at   = Column(DateTime, nullable=True)
-    created_at   = Column(DateTime, default=datetime.utcnow)
+    created_at   = Column(DateTime, default=_utcnow)
 
 
 class Income(Base):
@@ -119,7 +134,7 @@ class Income(Base):
     notes        = Column(String, default="")
     is_deleted   = Column(Boolean, default=False)
     deleted_at   = Column(DateTime, nullable=True)
-    created_at   = Column(DateTime, default=datetime.utcnow)
+    created_at   = Column(DateTime, default=_utcnow)
 
 
 class Savings(Base):
@@ -137,7 +152,7 @@ class Savings(Base):
     notes         = Column(String, default="")
     is_deleted    = Column(Boolean, default=False)
     deleted_at    = Column(DateTime, nullable=True)
-    created_at    = Column(DateTime, default=datetime.utcnow)
+    created_at    = Column(DateTime, default=_utcnow)
 
 
 class Budget(Base):
@@ -173,7 +188,7 @@ class AuditLog(Base):
     table_name = Column(String)
     record_id  = Column(String)
     details    = Column(Text)
-    timestamp  = Column(DateTime, default=datetime.utcnow)
+    timestamp  = Column(DateTime, default=_utcnow)
     ip_address = Column(String, nullable=True)
 
 
@@ -184,6 +199,8 @@ class UserSettings(Base):
     exchange_rate    = Column(Float, default=117.0)
     default_currency = Column(String, default="EUR")
     monthly_budget   = Column(Float, default=0.0)
+    # Per-currency exchange rates: {"USD": 1.08, "RSD": 117.0, ...} (1 EUR = X)
+    currency_rates   = Column(JSON, nullable=True)
     email_alerts     = Column(Boolean, default=False)
     alert_email      = Column(String, nullable=True)
     smtp_host        = Column(String, nullable=True)
@@ -195,10 +212,31 @@ class UserSettings(Base):
 # ── Init ──────────────────────────────────────────────────────────────────────
 
 def init_db():
-    Base.metadata.create_all(get_engine())
+    engine = get_engine()
+    Base.metadata.create_all(engine)
+    _migrate(engine)
+
+
+def _migrate(engine):
+    """Lightweight additive migrations for installs created before new columns."""
+    from sqlalchemy import inspect, text
+    insp = inspect(engine)
+    if "user_settings" in insp.get_table_names():
+        cols = {c["name"] for c in insp.get_columns("user_settings")}
+        if "currency_rates" not in cols:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE user_settings ADD COLUMN currency_rates JSON"))
 
 
 # ── Audit helper ──────────────────────────────────────────────────────────────
+
+def _json_default(o):
+    if isinstance(o, (datetime, date)):
+        return o.isoformat()
+    if isinstance(o, pd.Timestamp):
+        return o.isoformat()
+    return str(o)
+
 
 def log_audit(session, user_id, action, table_name, record_id, details, ip=None):
     entry = AuditLog(
@@ -278,7 +316,7 @@ def soft_delete_expense(user_id, expense_id):
         if not obj:
             return False
         obj.is_deleted = True
-        obj.deleted_at = datetime.utcnow()
+        obj.deleted_at = _utcnow()
         log_audit(s, user_id, "DELETE", "expenses", expense_id, {"soft": True})
     return True
 
@@ -333,7 +371,7 @@ def soft_delete_income(user_id, income_id):
         if not obj:
             return False
         obj.is_deleted = True
-        obj.deleted_at = datetime.utcnow()
+        obj.deleted_at = _utcnow()
         log_audit(s, user_id, "DELETE", "income", income_id, {"soft": True})
     return True
 
@@ -391,8 +429,19 @@ def soft_delete_savings(user_id, savings_id):
         if not obj:
             return False
         obj.is_deleted = True
-        obj.deleted_at = datetime.utcnow()
+        obj.deleted_at = _utcnow()
         log_audit(s, user_id, "DELETE", "savings", savings_id, {"soft": True})
+    return True
+
+
+def restore_savings(user_id, savings_id):
+    with get_session() as s:
+        obj = s.query(Savings).filter(Savings.id == savings_id, Savings.user_id == user_id).first()
+        if not obj:
+            return False
+        obj.is_deleted = False
+        obj.deleted_at = None
+        log_audit(s, user_id, "RESTORE", "savings", savings_id, {})
     return True
 
 
@@ -476,6 +525,7 @@ def update_recurring(user_id, rec_id, updates):
 
 _SETTINGS_DEFAULTS = {
     "exchange_rate": 117.0, "default_currency": "EUR", "monthly_budget": 0.0,
+    "currency_rates": None,
     "email_alerts": False, "alert_email": None, "smtp_host": None,
     "smtp_port": 587, "smtp_user": None, "smtp_password_enc": None,
 }
@@ -559,12 +609,24 @@ def get_household_members(household_id):
         return [{"id": m.id, "display_name": m.display_name or m.username} for m in members]
 
 
+def leave_household(user_id):
+    with get_session() as s:
+        u = s.query(User).filter(User.id == user_id).first()
+        if not u:
+            return False
+        u.household_id = None
+        log_audit(s, user_id, "UPDATE", "users", user_id, {"left_household": True})
+    return True
+
+
+_HH_EXP_COLS = _EXP_COLS + ["member"]
+
+
 def get_household_expenses(household_id, include_deleted=False):
     with get_session() as s:
-        member_ids = [m.id for m in s.query(User).filter(User.household_id == household_id).all()]
-        if not member_ids:
-            return pd.DataFrame(columns=_EXP_COLS)
-        q = s.query(Expense).filter(Expense.user_id.in_(member_ids))
+        rows = (s.query(Expense, User.display_name, User.username)
+                .join(User, Expense.user_id == User.id)
+                .filter(User.household_id == household_id))
         if not include_deleted:
             q = q.filter(Expense.is_deleted == False)
         rows = q.order_by(Expense.date.desc()).all()
@@ -654,3 +716,61 @@ def delete_user_account(user_id):
         s.query(AuditLog).filter(AuditLog.user_id == user_id).delete()
         s.query(User).filter(User.id == user_id).delete()
     return True
+
+
+# ── Backups (SQLite only) ─────────────────────────────────────────────────────
+
+def backup_db(force: bool = False):
+    """Copy the SQLite database into data/backups once per day (WAL-safe).
+
+    Returns the backup path, or None when not applicable / already done today.
+    """
+    engine = get_engine()
+    if engine.dialect.name != "sqlite" or not os.path.exists(DB_PATH):
+        return None
+
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    today = date.today()
+    marker = os.path.join(BACKUP_DIR, ".last_backup")
+    try:
+        last = open(marker, "r", encoding="utf-8").read().strip()
+    except OSError:
+        last = None
+    if not force and last == today.isoformat():
+        return None
+
+    dest = os.path.join(BACKUP_DIR, f"expense_tracker_{today.isoformat()}.db")
+    if not os.path.exists(dest):
+        src = sqlite3.connect(DB_PATH)
+        try:
+            dst = sqlite3.connect(dest)
+            try:
+                with dst:
+                    src.backup(dst)
+            finally:
+                dst.close()
+        finally:
+            src.close()
+
+    with open(marker, "w", encoding="utf-8") as f:
+        f.write(today.isoformat())
+
+    # Prune old backups
+    try:
+        from utils import BACKUP_RETENTION_DAYS
+        retention = BACKUP_RETENTION_DAYS
+    except Exception:
+        retention = 30
+    for fn in os.listdir(BACKUP_DIR):
+        if not (fn.startswith("expense_tracker_") and fn.endswith(".db")):
+            continue
+        try:
+            d = date.fromisoformat(fn[len("expense_tracker_"):-3])
+        except ValueError:
+            continue
+        if (today - d).days > retention:
+            try:
+                os.remove(os.path.join(BACKUP_DIR, fn))
+            except OSError:
+                pass
+    return dest

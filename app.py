@@ -1,49 +1,26 @@
 """
-app.py — Expense Tracker v3 — Consumer Edition
-Main Streamlit entry point. Integrates auth, database, insights,
-gamification, notifications, and bank import.
+app.py — Expense Tracker v4 — Consumer Edition
+Main Streamlit entry point: auth/onboarding gates, shared sidebar, alerts,
+and st.navigation-based page routing (pages live in app_pages/).
 """
 
-import io
-import uuid
-import calendar
-import datetime as dt
-from datetime import date
-
-import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
 
-from db import (
-    init_db,
-    get_expenses, add_expense, update_expense, soft_delete_expense, restore_expense,
-    get_income, add_income, soft_delete_income, restore_income,
-    get_savings, add_savings, soft_delete_savings,
-    get_budgets, add_budget, delete_budget,
-    get_recurring, add_recurring, update_recurring,
-    get_settings, save_settings,
-    get_audit_log,
-    create_household, join_household, get_household_members, get_household_expenses,
-    set_onboarding_complete, update_user_display_name, delete_user_account,
-)
-from auth import require_auth, logout, change_password
+import queries as q
+from db import init_db, backup_db, get_settings
+from auth import require_auth, logout
+from onboarding import render_onboarding
 from utils import (
-    CATEGORIES, INCOME_SOURCES, SAVINGS_GOALS, CHART_COLORS, CAT_LIST,
-    SUPPORTED_CURRENCIES, NEAR_LIMIT_THRESHOLD, SAVINGS_TARGET_PCT, SAVINGS_GOAL_PCT,
-    APP_PORT, MAX_AMOUNT, MAX_SAVINGS_TARGET,
-    fmt, fmt_both, pbar, get_currency_symbol, to_display,
-    safe_error, safe_warning, help_expander, inject_mobile_css, get_ip,
+    SUPPORTED_CURRENCIES, get_rates, get_currency_symbol,
+    get_lan_urls, get_server_port, qr_svg,
+    inject_mobile_css,
 )
-from insights import render_insights
 from gamification import render_gamification_sidebar
 from notifications import (
     check_and_send_budget_alerts, check_and_send_bill_reminders,
-    render_notification_settings,
 )
-from bank_import import render_bank_import_page
 
-# ── Page config ───────────────────────────────────────────────────────────────
+# ── Page config & boot ────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="💰 Expense Tracker",
     page_icon="💰",
@@ -52,13 +29,18 @@ st.set_page_config(
 )
 inject_mobile_css()
 init_db()
+backup_db()
 
 # ── Auth gate ─────────────────────────────────────────────────────────────────
 if not require_auth():
     st.stop()
 
+# ── Shared session state ──────────────────────────────────────────────────────
 user_id      = st.session_state.user_id
 display_name = st.session_state.display_name
+if "db_version" not in st.session_state:
+    st.session_state.db_version = 0
+st.session_state.settings = get_settings(user_id)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -190,40 +172,33 @@ if not st.session_state.get("onboarding_complete", True):
     render_onboarding()
     st.stop()
 
+settings = st.session_state.settings
+rates    = get_rates(settings)
+st.session_state.rates = rates
 
-# ══════════════════════════════════════════════════════════════════════════════
-# MAIN APP
-# ══════════════════════════════════════════════════════════════════════════════
-
-settings = get_settings(user_id)
-rate     = float(settings.get("exchange_rate", 117.0))
-
-PAGES = [
-    "📅 Log Expense", "💵 Log Income", "🎯 Savings Goals", "🔄 Recurring",
-    "📊 Dashboard", "📈 Forecast", "💡 Insights", "🏦 Bank Import",
-    "📋 Audit Log", "👥 Household", "⚙️ Settings",
-]
-
-# ── Sidebar ───────────────────────────────────────────────────────────────────
+# ── Shared sidebar ────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown(f"## 👋 {display_name}")
-    page = st.radio("Navigate", PAGES, label_visibility="collapsed")
-    st.divider()
 
     st.markdown("**Display currency**")
-    cur_list = list(SUPPORTED_CURRENCIES.keys())
+    cur_list  = list(SUPPORTED_CURRENCIES.keys())
     dc_default = settings.get("default_currency", "EUR")
-    dc_idx = cur_list.index(dc_default) if dc_default in cur_list else 0
-    DC = st.selectbox("Currency", cur_list, index=dc_idx, label_visibility="collapsed")
+    dc_idx    = cur_list.index(dc_default) if dc_default in cur_list else 0
+    DC = st.selectbox("Currency", cur_list, index=dc_idx, key="dc_sidebar")
+    st.session_state.dc = DC
     SYM = get_currency_symbol(DC)
 
-    st.markdown("**💱 Exchange rate (1 EUR)**")
-    nr = st.number_input("Rate", value=rate, step=1.0, format="%.2f",
-                          label_visibility="collapsed")
-    if abs(nr - rate) > 0.001:
-        save_settings(user_id, {**settings, "exchange_rate": nr})
+    with st.form("rate_form"):
+        rsd_val = st.number_input(f"Exchange rate (1 EUR = ? {SYM})",
+                                  value=float(rates.get("RSD", 117.0)),
+                                  step=1.0, format="%.2f")
+        saved_rate = st.form_submit_button("💱 Update rate")
+    if saved_rate:
+        new_rates = dict(st.session_state.settings.get("currency_rates") or {})
+        new_rates["RSD"] = float(rsd_val)
+        q.save_settings(user_id, {"currency_rates": new_rates})
         st.rerun()
-    st.caption(f"1 EUR = {rate:.2f} {get_currency_symbol(DC)}")
+    st.caption(f"1 EUR = {rates['RSD']:.2f} din · other rates in ⚙️ Settings")
 
     st.divider()
 
@@ -704,521 +679,44 @@ elif page == "📊 Dashboard":
     sr = (sd / ie * 100) if ie > 0 else 0.0
 
     st.divider()
-    k1, k2, k3, k4, k5 = st.columns(5)
-    for col, lbl, eur, cls in [
-        (k1, "Income",       ie,   "pos"),
-        (k2, "Expenses",     ee,   "neg"),
-        (k3, "Saved",        sd,   "pos"),
-        (k4, "Net Balance",  ne,   "pos" if ne >= 0 else "neg"),
-        (k5, "Savings Rate", None, "pos" if sr >= 15 else "neg"),
-    ]:
-        with col:
-            v   = f"{sr:.1f}%" if lbl == "Savings Rate" else fmt(eur, DC, rate)
-            sub = "" if lbl == "Savings Rate" else (
-                f'<div class="kpi-sub">'
-                f'{fmt(eur, "RSD" if DC == "EUR" else "EUR", rate)}'
-                f'</div>'
-            )
-            st.markdown(
-                f'<div class="kpi">'
-                f'<div class="kpi-lbl">{lbl}</div>'
-                f'<div class="kpi-val {cls}">{v}</div>{sub}'
-                f'</div>', unsafe_allow_html=True
-            )
+
+    # Phone access panel
+    st.markdown("**📱 Phone access**")
+    port = get_server_port()
+    urls, hostname = get_lan_urls(port)
+    if urls:
+        st.code(urls[0], language=None)
+        st.html(f'<div style="text-align:center;margin:4px 0;">{qr_svg(urls[0])}</div>')
+        st.caption("Scan with your phone camera — same Wi-Fi network.")
+        if hostname:
+            st.caption(f"or http://{hostname}:{port}")
+    else:
+        st.caption("Start the server with `run_server.bat` and allow Private network access in the firewall prompt.")
+
     st.divider()
 
-    # Budget alerts
-    if not dfb.empty and not exp.empty:
-        bf = dfb[dfb["year"] == sy]
-        if sm > 0: bf = bf[bf["month"] == sm]
-        cb  = bf.groupby("category")["budgeted_eur"].sum()
-        ca  = exp.groupby("category")["amount_eur"].sum()
-        alts = []
-        for c in ca.index:
-            bud_val = float(cb.get(c, 0))
-            act_val = float(ca.get(c, 0))
-            if bud_val > 0 and act_val > bud_val * NEAR_LIMIT_THRESHOLD:
-                if act_val > bud_val:
-                    alts.append(("🔴", "error", c, act_val, bud_val,
-                                  f"Over by {fmt(act_val - bud_val, DC, rate)}"))
-                else:
-                    alts.append(("🟡", "warning", c, act_val, bud_val,
-                                  f"{act_val / bud_val * 100:.0f}% used"))
-        if alts:
-            st.subheader("⚠️ Budget alerts")
-            for icon, lvl, c, a, b, msg in alts:
-                fn = st.error if lvl == "error" else st.warning
-                fn(f"{icon} **{c}** — spent {fmt(a, DC, rate)} of {fmt(b, DC, rate)} budget. {msg}")
-            st.divider()
+    if st.button("🚪 Logout", width="stretch"):
+        logout()
+        st.rerun()
 
-    # Charts row 1
-    r1a, r1b = st.columns(2)
-    with r1a:
-        st.subheader("Spending by category")
-        if not exp.empty:
-            ct  = exp.groupby("category")["amount_eur"].sum().reset_index()
-            ct["d"] = ct["amount_eur"].apply(lambda x: to_display(x, DC, rate))
-            fig = px.pie(ct, values="d", names="category", hole=0.45,
-                         color_discrete_sequence=CHART_COLORS)
-            fig.update_traces(textposition="inside", textinfo="percent+label")
-            fig.update_layout(showlegend=False, margin=dict(t=0,b=0,l=0,r=0),
-                              plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No expenses for this period.")
+# ── Recurring bill & budget alerts (once per rerun; session-state deduped) ────
+settings = st.session_state.settings
+DC       = st.session_state.dc
+check_and_send_bill_reminders(user_id, q.recurring(user_id), q.expenses(user_id), settings)
+check_and_send_budget_alerts(user_id, q.expenses(user_id), q.budgets(user_id), settings, rates, DC)
 
-    with r1b:
-        st.subheader("Budget vs actual")
-        if not exp.empty:
-            ac = exp.groupby("category")["amount_eur"].sum().reset_index().rename(
-                columns={"amount_eur": "ae"})
-            if not dfb.empty:
-                bf2 = dfb[dfb["year"] == sy]
-                if sm > 0: bf2 = bf2[bf2["month"] == sm]
-                bc  = bf2.groupby("category")["budgeted_eur"].sum().reset_index()
-                mg  = ac.merge(bc, on="category", how="outer").fillna(0)
-            else:
-                mg = ac.copy(); mg["budgeted_eur"] = 0
-            mg["status"] = mg.apply(
-                lambda r: "Over budget" if r["budgeted_eur"] > 0 and r["ae"] > r["budgeted_eur"]
-                else ("Near limit" if r["budgeted_eur"] > 0 and r["ae"] > r["budgeted_eur"] * NEAR_LIMIT_THRESHOLD
-                      else "On track"), axis=1)
-            cmap = {"Over budget": "#E94560", "Near limit": "#F4A261", "On track": "#00B050"}
-            fig  = go.Figure()
-            fig.add_trace(go.Bar(name="Budget", x=mg["category"],
-                                 y=mg["budgeted_eur"].apply(lambda x: to_display(x, DC, rate)),
-                                 marker_color="#0F3460", opacity=0.45))
-            for st2, col2 in cmap.items():
-                sub = mg[mg["status"] == st2]
-                if not sub.empty:
-                    fig.add_trace(go.Bar(name=st2, x=sub["category"],
-                                         y=sub["ae"].apply(lambda x: to_display(x, DC, rate)),
-                                         marker_color=col2, opacity=0.9))
-            fig.update_layout(barmode="group", plot_bgcolor="rgba(0,0,0,0)",
-                              paper_bgcolor="rgba(0,0,0,0)",
-                              margin=dict(t=0,b=0),
-                              legend=dict(orientation="h", y=1.08),
-                              xaxis_tickangle=-30, yaxis_title=SYM)
-            st.plotly_chart(fig, use_container_width=True)
-
-    # Monthly trends
-    st.subheader("Monthly trends")
-    def mv(df, col, m):
-        if df.empty: return 0.0
-        return float(df[(df["date"].dt.year == sy) & (df["date"].dt.month == m)][col].sum())
-
-    trnd = pd.DataFrame([{
-        "Month":    calendar.month_abbr[m],
-        "Income":   to_display(mv(dfi, "actual_eur", m),    DC, rate),
-        "Expenses": to_display(mv(dfe, "amount_eur", m),    DC, rate),
-        "Savings":  to_display(mv(dfs, "deposited_eur", m), DC, rate),
-    } for m in range(1, 13)])
-    fig = go.Figure()
-    for col3, clr, dsh in [("Income","#00B050","solid"),("Expenses","#E94560","solid"),("Savings","#0F3460","dot")]:
-        fig.add_trace(go.Scatter(x=trnd["Month"], y=trnd[col3], name=col3,
-                                 line=dict(color=clr, width=2.5, dash=dsh), mode="lines+markers"))
-    fig.update_layout(plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-                      legend=dict(orientation="h", y=1.06), margin=dict(t=20,b=0), yaxis_title=SYM)
-    st.plotly_chart(fig, use_container_width=True)
-
-    # Savings rate chart
-    r3a, r3b = st.columns(2)
-    with r3a:
-        st.subheader("Savings rate by month")
-        rts = pd.DataFrame([{
-            "Month": calendar.month_abbr[m],
-            "Rate%": round(mv(dfs, "deposited_eur", m) / mv(dfi, "actual_eur", m) * 100, 1)
-                     if mv(dfi, "actual_eur", m) > 0 else 0
-        } for m in range(1, 13)])
-        fig = px.bar(rts, x="Month", y="Rate%",
-                     text=rts["Rate%"].apply(lambda x: f"{x:.1f}%"),
-                     color="Rate%", color_continuous_scale=["#E94560","#F4A261","#00B050"],
-                     range_color=[0, 30])
-        fig.add_hline(y=SAVINGS_TARGET_PCT, line_dash="dash", line_color="#F4A261",
-                      annotation_text=f"{SAVINGS_TARGET_PCT}% target")
-        fig.add_hline(y=SAVINGS_GOAL_PCT, line_dash="dash", line_color="#00B050",
-                      annotation_text=f"{SAVINGS_GOAL_PCT}% goal")
-        fig.update_traces(textposition="outside")
-        fig.update_layout(coloraxis_showscale=False, plot_bgcolor="rgba(0,0,0,0)",
-                          paper_bgcolor="rgba(0,0,0,0)", margin=dict(t=20,b=0))
-        st.plotly_chart(fig, use_container_width=True)
-
-    with r3b:
-        st.subheader("Savings balance")
-        if not svyr.empty:
-            sp  = svyr.sort_values("date").copy()
-            sp["bd"] = sp["balance_eur"].apply(lambda x: to_display(x, DC, rate))
-            fig = px.area(sp, x="date", y="bd", color="goal_name",
-                          labels={"bd": f"Balance ({SYM})", "goal_name": "Goal"},
-                          color_discrete_sequence=CHART_COLORS)
-            fig.update_layout(legend_title_text="", plot_bgcolor="rgba(0,0,0,0)",
-                              paper_bgcolor="rgba(0,0,0,0)")
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No savings data for this year.")
-
-    # Top 10
-    if not exp.empty:
-        st.subheader("Top 10 largest expenses")
-        tp = exp.nlargest(10, "amount_eur")[
-            ["date","category","subcategory","description","amount_eur","currency"]
-        ].copy()
-        tp["date"]     = tp["date"].dt.strftime("%d %b %Y").fillna("")
-        tp["EUR / RSD"]= tp["amount_eur"].apply(lambda x: fmt_both(x, rate))
-        st.dataframe(tp.drop(columns=["amount_eur"]), use_container_width=True, hide_index=True)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PAGE: FORECAST
-# ══════════════════════════════════════════════════════════════════════════════
-elif page == "📈 Forecast":
-    st.title("📈 Spending Forecast")
-    st.caption("Based on your salary cycle: detected from your last income entry.")
-
-    today      = date.today()
-    dfi_all    = get_income(user_id)
-    SALARY_DAY = 10
-
-    salary_rows = dfi_all[dfi_all["source"] == "Primary Salary"] if not dfi_all.empty else pd.DataFrame()
-    if salary_rows.empty:
-        period_start = date(today.year, today.month, SALARY_DAY) if today.day >= SALARY_DAY else (
-            date(today.year, today.month - 1, SALARY_DAY) if today.month > 1
-            else date(today.year - 1, 12, SALARY_DAY)
-        )
-        safe_warning("No salary entry found — using the 10th as cycle start. "
-                     "Log a 'Primary Salary' income entry to enable automatic detection.")
-    else:
-        latest_salary = salary_rows.sort_values("date").iloc[-1]
-        period_start  = latest_salary["date"].date()
-        st.success(f"✅ Cycle start: **{period_start.strftime('%d %b %Y')}**")
-
-    next_m      = period_start.month + 1 if period_start.month < 12 else 1
-    next_y      = period_start.year  if period_start.month < 12 else period_start.year + 1
-    period_end  = date(next_y, next_m, period_start.day) - dt.timedelta(days=1)
-
-    days_in_period = (period_end - period_start).days + 1
-    days_elapsed   = max((today - period_start).days + 1, 1)
-    days_remaining = max((period_end - today).days, 0)
-
-    st.info(f"📅 **{period_start.strftime('%d %b')} → {period_end.strftime('%d %b %Y')}** "
-            f"({days_in_period} days · {days_elapsed} in · {days_remaining} left)")
-
-    dfe = get_expenses(user_id)
-    dfb = get_budgets(user_id)
-    period_start_ts = pd.Timestamp(period_start)
-    period_end_ts   = pd.Timestamp(period_end)
-
-    period_exp = dfe[
-        (dfe["date"] >= period_start_ts) & (dfe["date"] <= period_end_ts)
-    ].copy() if not dfe.empty else pd.DataFrame(columns=["amount_eur","date","category"])
-
-    st.divider()
-    st.subheader("💰 Total spending forecast")
-
-    total_spent = float(period_exp["amount_eur"].sum()) if not period_exp.empty else 0.0
-    daily_avg   = total_spent / days_elapsed if days_elapsed > 0 else 0.0
-    projected   = daily_avg * days_in_period
-
-    total_budget = 0.0
-    overall_bud  = float(settings.get("monthly_budget", 0.0))
-    if overall_bud > 0:
-        total_budget = overall_bud
-    elif not dfb.empty:
-        bud_m = dfb[(dfb["year"] == period_start.year) &
-                    (dfb["month"] == period_start.month)]["budgeted_eur"].sum()
-        total_budget = float(bud_m)
-
-    over_under = projected - total_budget
-    on_track   = total_budget == 0 or projected <= total_budget
-
-    fc1, fc2, fc3, fc4 = st.columns(4)
-    for col, lbl, val, cls in [
-        (fc1, "Spent so far",    total_spent,  "neg"),
-        (fc2, "Daily average",   daily_avg,    "neu"),
-        (fc3, "Projected total", projected,    "pos" if on_track else "neg"),
-        (fc4, "Monthly budget",  total_budget, "neu"),
-    ]:
-        with col:
-            st.markdown(
-                f'<div class="kpi">'
-                f'<div class="kpi-lbl">{lbl}</div>'
-                f'<div class="kpi-val {cls}">{fmt(val, DC, rate)}</div>'
-                f'<div class="kpi-sub">{fmt(val, "RSD" if DC=="EUR" else "EUR", rate)}</div>'
-                f'</div>', unsafe_allow_html=True
-            )
-
-    st.write("")
-    if total_budget == 0:
-        safe_warning("No budget set. Go to ⚙️ Settings → Budget to set one.")
-    elif on_track:
-        st.success(f"✅ On track! Projected: **{fmt(projected, DC, rate)}** — "
-                   f"**{fmt(total_budget - projected, DC, rate)} under budget**.")
-    else:
-        st.error(f"⚠️ Overspend risk. Projected: **{fmt(projected, DC, rate)}** — "
-                 f"**{fmt(over_under, DC, rate)} over budget**. "
-                 f"Target: **{fmt((total_budget - total_spent) / max(days_remaining, 1), DC, rate)}/day**.")
-
-    if total_budget > 0:
-        pct_spent = min(total_spent / total_budget * 100, 100)
-        bar_color = "#00B050" if on_track else "#E94560"
-        st.markdown(f"**Spent** {fmt(total_spent, DC, rate)} of {fmt(total_budget, DC, rate)} ({pct_spent:.1f}%)")
-        st.markdown(pbar(pct_spent, bar_color), unsafe_allow_html=True)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PAGE: INSIGHTS
-# ══════════════════════════════════════════════════════════════════════════════
-elif page == "💡 Insights":
-    render_insights(
-        get_expenses(user_id), get_income(user_id),
-        get_savings(user_id), settings, DC, rate,
-    )
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PAGE: BANK IMPORT
-# ══════════════════════════════════════════════════════════════════════════════
-elif page == "🏦 Bank Import":
-    render_bank_import_page(user_id, rate)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PAGE: AUDIT LOG
-# ══════════════════════════════════════════════════════════════════════════════
-elif page == "📋 Audit Log":
-    st.title("📋 Audit Log")
-    help_expander("What is the audit log?",
-                  "Every change you make — adding expenses, editing, deleting, "
-                  "changing settings — is recorded here. This gives you a complete "
-                  "history of what happened to your data.")
-
-    df_audit = get_audit_log(user_id, limit=200)
-    if df_audit.empty:
-        st.info("No activity recorded yet.")
-    else:
-        actions = df_audit["action"].unique().tolist()
-        filt = st.multiselect("Filter by action", actions, default=actions, key="audit_filt")
-        df_show = df_audit[df_audit["action"].isin(filt)].copy()
-        df_show["timestamp"] = df_show["timestamp"].dt.strftime("%d %b %Y %H:%M")
-        st.dataframe(
-            df_show[["timestamp","action","table_name","record_id","details"]],
-            use_container_width=True, hide_index=True,
-        )
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PAGE: HOUSEHOLD
-# ══════════════════════════════════════════════════════════════════════════════
-elif page == "👥 Household":
-    st.title("👥 Shared Household")
-    st.caption("Share your budget view with family or a partner.")
-    help_expander("How households work",
-                  "Create a household and share the invite code with your partner or family. "
-                  "Once they join, you can view combined expenses on the Dashboard.")
-
-    hh_id = st.session_state.get("household_id")
-
-    if not hh_id:
-        tab_create, tab_join = st.tabs(["🏠 Create household", "🔗 Join existing"])
-        with tab_create:
-            with st.form("hh_create"):
-                hh_name = st.text_input("Household name", placeholder="e.g. The Smiths")
-                if st.form_submit_button("Create →", type="primary"):
-                    if hh_name.strip():
-                        new_hh_id, code = create_household(user_id, hh_name.strip())
-                        st.session_state.household_id = new_hh_id
-                        st.success(f"✅ Household created!")
-                        st.info(f"**Invite code:** `{code}` — share this with your partner.")
-                        st.rerun()
-                    else:
-                        safe_error("Please enter a household name.")
-        with tab_join:
-            with st.form("hh_join"):
-                code_in = st.text_input("Invite code", placeholder="e.g. AB12CD34")
-                if st.form_submit_button("Join →", type="primary"):
-                    if join_household(user_id, code_in):
-                        st.success("✅ Joined household!")
-                        st.rerun()
-                    else:
-                        safe_error("Invalid invite code. Please check and try again.")
-    else:
-        members = get_household_members(hh_id)
-        st.subheader(f"👥 {len(members)} member(s)")
-        for m in members:
-            st.markdown(f"- {m['display_name']}")
-
-        hh_exp = get_household_expenses(hh_id)
-        if not hh_exp.empty:
-            st.divider()
-            st.subheader("Combined expenses")
-            ct = hh_exp.groupby("category")["amount_eur"].sum().reset_index()
-            ct["d"] = ct["amount_eur"].apply(lambda x: to_display(x, DC, rate))
-            fig = px.pie(ct, values="d", names="category", hole=0.4,
-                         color_discrete_sequence=CHART_COLORS)
-            fig.update_traces(textposition="inside", textinfo="percent+label")
-            fig.update_layout(showlegend=False, margin=dict(t=0,b=0,l=0,r=0),
-                              plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
-            st.plotly_chart(fig, use_container_width=True)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PAGE: SETTINGS
-# ══════════════════════════════════════════════════════════════════════════════
-elif page == "⚙️ Settings":
-    st.title("⚙️ Settings")
-
-    tab_cur, tab_bud, tab_notif, tab_acct, tab_data = st.tabs(
-        ["💱 Currency", "💰 Budget", "📧 Notifications", "🔐 Account", "📦 Data"]
-    )
-
-    # ── Currency tab ──────────────────────────────────────────────────────────
-    with tab_cur:
-        st.subheader("💱 Currency & Exchange Rate")
-        with st.form("cur_form"):
-            nr2 = st.number_input("Exchange rate (1 EUR = ? local)",
-                                   value=float(settings.get("exchange_rate", 117.0)),
-                                   step=0.5, format="%.2f")
-            dc2 = st.selectbox("Default display currency",
-                                list(SUPPORTED_CURRENCIES.keys()),
-                                index=list(SUPPORTED_CURRENCIES.keys()).index(
-                                    settings.get("default_currency","EUR")))
-            if st.form_submit_button("💾 Save", type="primary"):
-                save_settings(user_id, {"exchange_rate": nr2, "default_currency": dc2})
-                st.success(f"✅ Saved — 1 EUR = {nr2:.2f} {get_currency_symbol(dc2)}")
-                st.rerun()
-
-    # ── Budget tab ────────────────────────────────────────────────────────────
-    with tab_bud:
-        st.subheader("💰 Overall Monthly Budget")
-        cur_eur = float(settings.get("monthly_budget", 0.0))
-        with st.form("overall_bud_form"):
-            ob_amt = st.number_input("Total monthly budget (€)", min_value=0.0,
-                                     max_value=MAX_SAVINGS_TARGET,
-                                     step=50.0, format="%.2f", value=cur_eur)
-            if st.form_submit_button("💾 Save budget", type="primary"):
-                save_settings(user_id, {"monthly_budget": ob_amt})
-                st.success(f"✅ Budget set to {fmt_both(ob_amt, rate)}")
-                st.rerun()
-
-        st.divider()
-        st.subheader("Category Budgets")
-        bcat = st.selectbox("Category", CAT_LIST, key="bud_cat")
-        bcur = st.selectbox("Enter in", list(SUPPORTED_CURRENCIES.keys()), key="bud_cur")
-        with st.form("cat_bud_form", clear_on_submit=False):
-            bc1, bc2, bc3 = st.columns(3)
-            with bc1:
-                by = st.number_input("Year",  value=date.today().year,  step=1, format="%d")
-                bm = st.selectbox("Month", range(1,13),
-                                  format_func=lambda x: calendar.month_name[x])
-            with bc2:
-                bsub = st.selectbox("Subcategory",
-                                    ["(entire category)"] + CATEGORIES[bcat])
-            with bc3:
-                ba = st.number_input(f"Budget ({_cur_sym(bcur)})", min_value=0.0,
-                                     max_value=MAX_SAVINGS_TARGET, step=10.0, format="%.2f")
-            if st.form_submit_button("💾 Save", type="primary"):
-                be = _eur(ba, bcur, rate)
-                add_budget(user_id, {
-                    "year": int(by), "month": int(bm), "category": bcat,
-                    "subcategory": bsub if bsub != "(entire category)" else "",
-                    "budgeted_eur": be,
-                })
-                st.success("✅ Budget saved")
-                st.rerun()
-
-        dfb = get_budgets(user_id)
-        if not dfb.empty:
-            d = dfb.copy()
-            d["month"]  = d["month"].apply(lambda x: calendar.month_name[int(x)])
-            d["Budget"] = d["budgeted_eur"].apply(lambda x: fmt_both(x, rate))
-            st.dataframe(d[["year","month","category","subcategory","Budget"]],
-                         use_container_width=True, hide_index=True)
-            with st.expander("🗑️ Delete a budget row"):
-                di = st.number_input("Row index (from table)", min_value=0,
-                                     max_value=max(0, len(dfb)-1), step=1)
-                if st.button("Delete", type="secondary", key="del_bud"):
-                    bid = int(dfb.iloc[di]["id"])
-                    delete_budget(user_id, bid)
-                    st.toast("Budget row deleted.", icon="🗑️")
-                    st.rerun()
-
-    # ── Notifications tab ─────────────────────────────────────────────────────
-    with tab_notif:
-        render_notification_settings(user_id, settings)
-
-    # ── Account tab ───────────────────────────────────────────────────────────
-    with tab_acct:
-        st.subheader("🔐 Account")
-
-        with st.form("display_name_form"):
-            new_name = st.text_input("Display name", value=display_name)
-            if st.form_submit_button("💾 Update name"):
-                if new_name.strip():
-                    update_user_display_name(user_id, new_name.strip())
-                    st.session_state.display_name = new_name.strip()
-                    st.success("✅ Name updated!")
-                    st.rerun()
-
-        st.divider()
-        st.subheader("Change Password")
-        with st.form("pw_form"):
-            old_pw  = st.text_input("Current password", type="password")
-            new_pw  = st.text_input("New password", type="password",
-                                    placeholder="min. 8 chars, one number")
-            conf_pw = st.text_input("Confirm new password", type="password")
-            if st.form_submit_button("🔒 Change password", type="primary"):
-                if new_pw != conf_pw:
-                    safe_error("New passwords don't match.")
-                else:
-                    ok, msg = change_password(user_id, old_pw, new_pw)
-                    if ok:
-                        st.success(f"✅ {msg}")
-                    else:
-                        safe_error(msg)
-
-        st.divider()
-        st.subheader("⚠️ Danger Zone")
-        with st.expander("🗑️ Delete my account"):
-            st.error("This will permanently delete **all** your data. This cannot be undone.")
-            confirm = st.text_input("Type DELETE to confirm")
-            if st.button("Delete account permanently", type="secondary"):
-                if confirm == "DELETE":
-                    delete_user_account(user_id)
-                    logout()
-                    st.rerun()
-                else:
-                    safe_error("Please type DELETE exactly to confirm.")
-
-    # ── Data tab ──────────────────────────────────────────────────────────────
-    with tab_data:
-        st.subheader("📦 Export Your Data")
-        st.caption("Download your data as Excel files. Back these up to Google Drive or OneDrive regularly.")
-
-        data_map = {
-            "expenses":  get_expenses(user_id, include_deleted=True),
-            "income":    get_income(user_id, include_deleted=True),
-            "savings":   get_savings(user_id, include_deleted=True),
-            "budgets":   get_budgets(user_id),
-            "recurring": get_recurring(user_id),
-        }
-        cols = st.columns(len(data_map))
-        for i, (key, df_d) in enumerate(data_map.items()):
-            with cols[i]:
-                if not df_d.empty:
-                    st.download_button(
-                        f"⬇️ {key}", data=to_excel(df_d),
-                        file_name=f"{key}_export.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key=f"dl_{key}", use_container_width=True,
-                    )
-                else:
-                    st.button(f"{key} (empty)", disabled=True,
-                              use_container_width=True, key=f"dis_{key}")
-
-        st.divider()
-        st.subheader("📤 Audit Log Export")
-        df_audit_exp = get_audit_log(user_id, limit=10000)
-        if not df_audit_exp.empty:
-            st.download_button("⬇️ audit_log.xlsx", data=to_excel(df_audit_exp),
-                               file_name="audit_log.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+# ── Page routing ──────────────────────────────────────────────────────────────
+pg = st.navigation([
+    st.Page("app_pages/dashboard.py", title="Dashboard", icon=":material/dashboard:", default=True),
+    st.Page("app_pages/log_expense.py", title="Log expense", icon=":material/receipt_long:"),
+    st.Page("app_pages/log_income.py", title="Log income", icon=":material/payments:"),
+    st.Page("app_pages/savings.py", title="Savings goals", icon=":material/savings:"),
+    st.Page("app_pages/recurring.py", title="Recurring", icon=":material/event_repeat:"),
+    st.Page("app_pages/forecast.py", title="Forecast", icon=":material/query_stats:"),
+    st.Page("app_pages/insights_view.py", title="Insights", icon=":material/lightbulb:"),
+    st.Page("app_pages/bank_import_view.py", title="Bank import", icon=":material/account_balance:"),
+    st.Page("app_pages/audit_log.py", title="Audit log", icon=":material/history:"),
+    st.Page("app_pages/household.py", title="Household", icon=":material/groups:"),
+    st.Page("app_pages/settings.py", title="Settings", icon=":material/settings:"),
+])
+pg.run()
