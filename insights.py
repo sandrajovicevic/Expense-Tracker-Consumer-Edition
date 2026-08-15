@@ -206,8 +206,7 @@ def render_insights(expenses_df: pd.DataFrame, income_df: pd.DataFrame,
     # ── Insight 5: Budget burn rate ───────────────────────────────────────────
     total_budget = float(settings.get("monthly_budget", 0.0))
     if total_budget > 0 and not expenses_df.empty:
-        from datetime import date as _date
-        period_start = _date(today.year, today.month, 1)
+        period_start = date(today.year, today.month, 1)
         days_left = days_until_budget_depleted(expenses_df, total_budget, period_start)
         if days_left is not None:
             if days_left == 0:
