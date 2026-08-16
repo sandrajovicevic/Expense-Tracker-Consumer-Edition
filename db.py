@@ -517,7 +517,8 @@ def log_audit(session, user_id, action, table_name, record_id, details, ip=None)
     entry = AuditLog(
         user_id=user_id, action=action, table_name=table_name,
         record_id=str(record_id),
-        details=json.dumps(details, default=_json_default) if isinstance(details, dict) else str(details),
+        # default=str makes dates and other non-JSON objects serialisable
+        details=json.dumps(details, default=str) if isinstance(details, dict) else str(details),
         ip_address=ip
     )
     session.add(entry)
@@ -552,7 +553,9 @@ def get_expenses(user_id, include_deleted=False):
         if not include_deleted:
             q = q.filter(Expense.is_deleted == False)
         rows = q.order_by(Expense.date.desc()).all()
-    df = _to_df(rows, _EXP_COLS)
+        # Materialise while the session is still open — accessing attributes
+        # after the session closes raises DetachedInstanceError.
+        df = _to_df(rows, _EXP_COLS)
     return _parse_dates(df, ["date", "created_at", "deleted_at"])
 
 
@@ -826,7 +829,8 @@ _BUD_COLS = ["id","user_id","year","month","category","subcategory","budgeted_eu
 def get_budgets(user_id):
     with get_session() as s:
         rows = s.query(Budget).filter(Budget.user_id == user_id).all()
-    return _to_df(rows, _BUD_COLS)
+        # Materialise while the session is still open
+        return _to_df(rows, _BUD_COLS)
 
 
 def add_budget(user_id, row):
@@ -878,7 +882,9 @@ _REC_COLS = ["id","user_id","category","subcategory","description",
 def get_recurring(user_id):
     with get_session() as s:
         rows = s.query(Recurring).filter(Recurring.user_id == user_id).all()
-    return _to_df(rows, _REC_COLS)
+        # Materialise while the session is still open — this was raising
+        # DetachedInstanceError because _to_df ran after the session closed.
+        return _to_df(rows, _REC_COLS)
 
 
 def add_recurring(user_id, row):
@@ -1190,8 +1196,15 @@ def get_audit_log(user_id, limit=200):
                 .filter(AuditLog.user_id == user_id)
                 .order_by(AuditLog.timestamp.desc())
                 .limit(limit).all())
+        # Materialise all attributes while rows are still attached to the session
+        data = [{
+            "id": r.id, "user_id": r.user_id, "action": r.action,
+            "table_name": r.table_name, "record_id": r.record_id,
+            "details": r.details, "timestamp": r.timestamp,
+            "ip_address": r.ip_address,
+        } for r in rows]
     cols = ["id","user_id","action","table_name","record_id","details","timestamp","ip_address"]
-    df = _to_df(rows, cols)
+    df = pd.DataFrame(data, columns=cols)
     return _parse_dates(df, ["timestamp"])
 
 
@@ -1269,14 +1282,10 @@ def get_household_expenses(household_id, include_deleted=False):
                 .join(User, Expense.user_id == User.id)
                 .filter(User.household_id == household_id))
         if not include_deleted:
-            rows = rows.filter(Expense.is_deleted == False)
-        rows = rows.order_by(Expense.date.desc()).all()
-    data = []
-    for exp, display_name, username in rows:
-        rec = {c: getattr(exp, c) for c in _EXP_COLS}
-        rec["member"] = display_name or username
-        data.append(rec)
-    df = pd.DataFrame(data, columns=_HH_EXP_COLS)
+            q = q.filter(Expense.is_deleted == False)
+        rows = q.order_by(Expense.date.desc()).all()
+        # Materialise while the session is still open
+        df = _to_df(rows, _EXP_COLS)
     return _parse_dates(df, ["date", "created_at", "deleted_at"])
 
 
